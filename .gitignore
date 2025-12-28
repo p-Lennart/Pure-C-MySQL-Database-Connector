@@ -1,0 +1,9 @@
+# File ignores
+*.pem
+
+# Directory ignores
+bin/
+build/
+lib/
+pem/
+.vscode/
