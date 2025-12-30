@@ -2,6 +2,13 @@
 #include <stdlib.h>
 #include <mysql.h>
 
+void process_row(MYSQL_ROW *row) {
+    for (int i = 0; i <= 12; i++) {
+        printf("%s\t", (*row)[i]);
+    }
+    printf("\n");
+}
+
 int main(int argc, char *argv[]) {
     MYSQL *CONN;
 
@@ -33,7 +40,7 @@ int main(int argc, char *argv[]) {
     if (!password) {
         fprintf(stderr, "missing password env: SS_pwd\n");
         exit(1);
-    }
+}
 
     if (!database) {
         fprintf(stderr, "missing database env: SS_db\n");
@@ -97,34 +104,33 @@ int main(int argc, char *argv[]) {
     printf("-------------------------------\n");
     
     if (mysql_query(CONN, "SELECT * FROM uk_price_paid")) {
-        fprintf(stderr, "SELECT error: %s\n", mysql_error(CONN));
+        fprintf(stderr, "Query error: %s\n", mysql_error(CONN));
         goto error_exit;
     }
 
-    MYSQL_RES *result = mysql_store_result(CONN);
+    MYSQL_RES *result = mysql_use_result(CONN);
     if (result == NULL) {
         fprintf(stderr, "Result error: %s\n", mysql_error(CONN));
         goto error_exit;
     }
 
-    // Print results
+    // Process results  
     MYSQL_ROW row;
     printf("Table:\n");
+    // must fetch row until NULL when using use_result over store_result
     while ((row = mysql_fetch_row(result))) {
-        for (int i = 0; i <= 12; i++) {
-            printf("%s\t", row[i]);
-        }
-        printf("\n");
+        process_row(&row);
     }
 
+    mysql_free_result(result);
     mysql_close(CONN);
     mysql_library_end();
     printf("MySQL connection and client library successfully closed.\n");
-    return 0;
+    exit(0);
 
 error_exit:
     mysql_close(CONN);
     mysql_library_end();
     printf("MySQL connection and client library closed with error.\n");
-    return 1;
+    exit(1);
 }
