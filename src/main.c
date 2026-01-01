@@ -2,6 +2,11 @@
 #include <stdlib.h>
 #include <mysql.h>
 
+typedef struct {
+    const char *env_name;
+    const char **var_dest;
+} EnvMap;
+
 void process_row(MYSQL_ROW *row) {
     for (int i = 0; i <= 12; i++) {
         printf("%s\t", (*row)[i]);
@@ -9,43 +14,69 @@ void process_row(MYSQL_ROW *row) {
     printf("\n");
 }
 
+int ensure_envs(size_t envc, const EnvMap *envm)
+{
+    for (size_t i = 0; i < envc; i++) {
+        const char *val = getenv(envm[i].env_name);
+        if (!val) {
+            fprintf(stderr, "missing env %s\n", envm[i].env_name);
+            return 1;
+        }
+        *envm[i].var_dest = val;
+    }
+    return 0;
+}
+
+int query_singlestore(MYSQL *CONN) {
+    if (mysql_query(CONN, "SELECT * FROM uk_price_paid")) {
+        fprintf(stderr, "Query error: %s\n", mysql_error(CONN));
+        return 1;
+    }
+
+    MYSQL_RES *result = mysql_use_result(CONN);
+    if (result == NULL) {
+        fprintf(stderr, "Result error: %s\n", mysql_error(CONN));
+        mysql_free_result(result);
+        return 1;
+    }
+
+    // Process results  
+    MYSQL_ROW row;
+    printf("Table:\n");
+    // must fetch row until NULL when using use_result over store_result
+    while ((row = mysql_fetch_row(result))) {
+        process_row(&row);
+    }
+
+    mysql_free_result(result);
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     MYSQL *CONN;
 
     // Params
-    const char *host = getenv("SS_host");
-    const char *port_str = getenv("SS_port");
-    const char *username = getenv("SS_user");
-    const char *password = getenv("SS_pass");
-    const char *database = getenv("SS_db");
+    const char *host;
+    const char *port_str;
+    const char *username;
+    const char *password;
+    const char *database;
 
-    if (!host) {
-        fprintf(stderr, "missing host env: SS_host\n");
-        exit(1);
-    }
+    EnvMap envm[] = { 
+        { "SS_host", &host },
+        { "SS_port", &port_str },
+        { "SS_user", &username },
+        { "SS_pass", &password },
+        { "SS_db", &database },
+    };
 
-    if (!port_str) {
-        fprintf(stderr, "missing port env: SS_port\n");
+    if (ensure_envs(sizeof envm / sizeof envm[0], envm) != 0) {
+        fprintf(stderr, "Env variable misconfiguration.\n");
         exit(1);
     }
     
     unsigned int port = atoi(port_str);
     // if 0, mysql does default port handling, no exit
-
-    if (!username) {
-        fprintf(stderr, "missing username env: SS_usr\n");
-        exit(1);
-    }
-
-    if (!password) {
-        fprintf(stderr, "missing password env: SS_pwd\n");
-        exit(1);
-}
-
-    if (!database) {
-        fprintf(stderr, "missing database env: SS_db\n");
-        exit(1);
-    }
 
     if (mysql_library_init(0, NULL, NULL) != 0) {
         fprintf(stderr, "could not initialize MySQL client library\n");
@@ -62,21 +93,6 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
     printf("MySQL structure successfully initated with address %p.\n", CONN);
-    
-    // MariaDB connector will automatically check Windows System Store, do not need to manually load
-    // if (argc > 1) {
-    //     printf("SSL CA file specified, path %s\n", argv[1]);
-    //     FILE *file = fopen(argv[1], "r");
-    //     if (file != NULL) {
-    //         fclose(file);
-    //         mysql_options(CONN, MYSQL_OPT_SSL_CA, argv[1]);
-
-    //     } else {
-    //         printf("Failed to locate specified SSL CA file");
-    //     }
-    // } else {
-    //     printf("No SSL CA file specified.");
-    // }
     
     // SingleStore cloud specific options
     const char *tls_version = "TLSv1.2";
@@ -103,34 +119,18 @@ int main(int argc, char *argv[]) {
     printf("Successfully connected to host.\n");
     printf("-------------------------------\n");
     
-    if (mysql_query(CONN, "SELECT * FROM uk_price_paid")) {
-        fprintf(stderr, "Query error: %s\n", mysql_error(CONN));
-        goto error_exit;
-    }
+    int result = query_singlestore(CONN);
 
-    MYSQL_RES *result = mysql_use_result(CONN);
-    if (result == NULL) {
-        fprintf(stderr, "Result error: %s\n", mysql_error(CONN));
-        goto error_exit;
-    }
-
-    // Process results  
-    MYSQL_ROW row;
-    printf("Table:\n");
-    // must fetch row until NULL when using use_result over store_result
-    while ((row = mysql_fetch_row(result))) {
-        process_row(&row);
-    }
-
-    mysql_free_result(result);
     mysql_close(CONN);
     mysql_library_end();
     printf("MySQL connection and client library successfully closed.\n");
-    exit(0);
+    
+    if (result == 0) {
+        printf("Query sequence executed as intended.\n");
+        exit(0);
+    } else {
+        printf("Query sequence did not execute as intended.\n");
+        exit(1);
+    }
 
-error_exit:
-    mysql_close(CONN);
-    mysql_library_end();
-    printf("MySQL connection and client library closed with error.\n");
-    exit(1);
 }
