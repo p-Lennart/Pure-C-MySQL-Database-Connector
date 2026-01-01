@@ -1,21 +1,17 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <mysql.h>
+
+#define MAX_TABLE_OPTIONS (10)
+#define TABLE_NAME_CAP (25)
 
 typedef struct {
     const char *env_name;
     const char **var_dest;
 } EnvMap;
 
-void process_row(MYSQL_ROW *row) {
-    for (int i = 0; i <= 12; i++) {
-        printf("%s\t", (*row)[i]);
-    }
-    printf("\n");
-}
-
-int ensure_envs(size_t envc, const EnvMap *envm)
-{
+int ensure_envs(size_t envc, const EnvMap *envm) {
     for (size_t i = 0; i < envc; i++) {
         const char *val = getenv(envm[i].env_name);
         if (!val) {
@@ -27,29 +23,114 @@ int ensure_envs(size_t envc, const EnvMap *envm)
     return 0;
 }
 
-int query_singlestore(MYSQL *CONN) {
-    if (mysql_query(CONN, "SELECT * FROM uk_price_paid")) {
+int prompt_select_table(MYSQL *CONN, char (*table_name)[TABLE_NAME_CAP]) {
+    MYSQL_RES *result;
+    MYSQL_ROW row;
+
+    if (mysql_query(CONN, "SHOW TABLES;")) {
         fprintf(stderr, "Query error: %s\n", mysql_error(CONN));
         return 1;
     }
 
-    MYSQL_RES *result = mysql_use_result(CONN);
+    result = mysql_use_result(CONN);
     if (result == NULL) {
         fprintf(stderr, "Result error: %s\n", mysql_error(CONN));
-        mysql_free_result(result);
         return 1;
     }
 
-    // Process results  
-    MYSQL_ROW row;
-    printf("Table:\n");
-    // must fetch row until NULL when using use_result over store_result
-    while ((row = mysql_fetch_row(result))) {
-        process_row(&row);
+    char table_names[MAX_TABLE_OPTIONS][TABLE_NAME_CAP];
+    size_t table_count = 0;
+
+    printf("Select Table:\n");
+    while ((row = mysql_fetch_row(result)) && table_count < MAX_TABLE_OPTIONS) {
+        char *tname = row[0];
+        printf("[%zu] %s\n", table_count, tname);
+        
+        strncpy(table_names[table_count], tname, TABLE_NAME_CAP - 1);
+        table_names[table_count][TABLE_NAME_CAP - 1] = '\0';
+
+        table_count += 1;
     }
+
+    char buffer[32];
+    fgets(buffer, sizeof(buffer), stdin);
+    size_t sel_table = strtoul(buffer, NULL, 10);
+
+    if (sel_table >= table_count) {
+        printf("Did not select a table ∈ [0, %zu).\nDefaulting to [0] %s\n", table_count, table_names[0]);
+        sel_table = 0;
+    } else {
+        printf("Selected [%zu] %s\n", sel_table, table_names[sel_table]);
+    }
+    
+    strncpy(*table_name, table_names[sel_table], TABLE_NAME_CAP - 1);
+    (*table_name)[TABLE_NAME_CAP - 1] = '\0';
 
     mysql_free_result(result);
     return 0;
+}
+
+void print_query_result(MYSQL_RES *result) {
+    size_t num_fields = 0;
+    
+    MYSQL_FIELD *field;
+    while ((field = mysql_fetch_field(result))) {
+        printf("%s\t", field->name);
+        num_fields += 1;
+    }
+    printf("\n");
+    
+    // must fetch row until NULL when using use_result over store_result
+    MYSQL_ROW row;
+    while ((row = mysql_fetch_row(result))) {
+        for (size_t col = 0; col < num_fields; col++) {
+            printf("%s\t", row[col]);
+        }
+        printf("\n");
+    }
+}
+
+int query_singlestore(MYSQL *CONN) {
+    int status = 0;
+    
+    MYSQL_RES *result;
+    
+    char table_name[TABLE_NAME_CAP];
+    if (prompt_select_table(CONN, &table_name) != 0) {
+        printf("Could not fetch table information.\n");
+        status = 1;
+        goto cleanup;
+    }
+
+    const char *query_template = "SELECT COUNT(*) AS total_rows";
+    // const char *query_template = "SELECT * FROM %s LIMIT 20";
+    
+    char *query = malloc(strlen(query_template) - 2 + strlen(table_name) + 1);
+    sprintf(query, query_template, table_name);
+
+    printf("Query is: %s\n", query);
+    if (mysql_query(CONN, query)) {
+        fprintf(stderr, "Query error: %s\n", mysql_error(CONN));
+        status = 1;
+        goto cleanup;
+    }
+
+    result = mysql_use_result(CONN);
+    if (result == NULL) {
+        fprintf(stderr, "Result error: %s\n", mysql_error(CONN));
+        status = 1;
+        goto cleanup;
+    }
+
+    // Process query result
+    print_query_result(result);
+    
+    mysql_free_result(result);
+
+cleanup:
+    free(query);
+    query = NULL;
+    return status;
 }
 
 int main(int argc, char *argv[]) {
@@ -120,6 +201,7 @@ int main(int argc, char *argv[]) {
     printf("-------------------------------\n");
     
     int result = query_singlestore(CONN);
+    printf("-------------------------------\n");
 
     mysql_close(CONN);
     mysql_library_end();
