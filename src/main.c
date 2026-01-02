@@ -9,7 +9,7 @@
 
 #define MAX_TABLE_OPTIONS (10)
 #define TABLE_NAME_CAP (25)
-#define CHUNK_SIZE (5)
+#define ROW_LIMIT (5)
 
 #define STATUS_OK (0)
 
@@ -180,10 +180,10 @@ void *worker_routine(void *ptr) {
 char *build_thread_query(size_t thread_id, char *table_name) {
     printf("Building query for thread %zu\n", thread_id);
 
-    const char *query_template = "SELECT * FROM %s LIMIT %d OFFSET %d";
-    int offset = CHUNK_SIZE * thread_id;
+    const char *query_template = 
+        "SELECT MOD(DAY(date), %d) AS hash, date, price FROM %s WHERE MOD(DAY(date), %d)=%zu LIMIT %d;";
 
-    int query_len = snprintf(NULL, 0, query_template, table_name, CHUNK_SIZE, offset);
+    int query_len = snprintf(NULL, 0, query_template, NUM_THREADS, table_name, NUM_THREADS, thread_id, ROW_LIMIT);
     if (query_len < 0) {
         fprintf(stderr, "Failed length calculation for query!\n");
         return "";
@@ -195,7 +195,7 @@ char *build_thread_query(size_t thread_id, char *table_name) {
         return "";
     }
 
-    snprintf(query, query_len + 1, query_template, table_name, CHUNK_SIZE, offset);
+    snprintf(query, query_len + 1, query_template, NUM_THREADS, table_name, NUM_THREADS, thread_id, ROW_LIMIT);
 
     printf("Query is: %s\n", query);
     return query;
