@@ -7,7 +7,6 @@
 
 #define NUM_THREADS (1)
 
-#define STATUS_OK (0)
 #define MAX_TABLE_OPTIONS (10)
 #define TABLE_NAME_CAP (25)
 
@@ -31,23 +30,7 @@ typedef struct {
     const Conn_Args *conn_args;
     const char *query_string;
 } Thread_Args;
-} Env_Map;
 
-typedef struct {
-    const char *host;
-    unsigned int port;
-    const char *username;
-    const char *password;
-    const char *database;
-} Conn_Args;
-
-typedef struct {
-    const size_t thread_id;
-    const Conn_Args *conn_args;
-    const char *query_string;
-} Thread_Args;
-
-int ensure_envs(size_t envc, const Env_Map *envm) {
 int ensure_envs(size_t envc, const Env_Map *envm) {
     for (size_t i = 0; i < envc; i++) {
         const char *val = getenv(envm[i].env_name);
@@ -104,7 +87,6 @@ int prompt_select_table(MYSQL *CONN, char (*table_name)[TABLE_NAME_CAP]) {
     (*table_name)[TABLE_NAME_CAP - 1] = '\0';
 
     mysql_free_result(result);
-    return STATUS_OK;
     return STATUS_OK;
 }
 
@@ -189,7 +171,6 @@ void *worker_routine(void *ptr) {
     // Process query result
     print_query_result(result);
 
-
     mysql_free_result(result);
     printf("[Thread #%zu] Success.\n", thread_args->thread_id);
     return NULL;
@@ -198,34 +179,22 @@ void *worker_routine(void *ptr) {
 int main(int argc, char *argv[]) {
     const char *port_str;
     Conn_Args conn_args = {};
-    Conn_Args conn_args = {};
 
-    Env_Map envm[] = { 
-        { "SS_host", &(conn_args.host) },
     Env_Map envm[] = { 
         { "SS_host", &(conn_args.host) },
         { "SS_port", &port_str },
         { "SS_user", &(conn_args.username) },
         { "SS_pass", &(conn_args.password) },
         { "SS_db", &(conn_args.database) }
-        { "SS_user", &(conn_args.username) },
-        { "SS_pass", &(conn_args.password) },
-        { "SS_db", &(conn_args.database) }
     };
 
-    if (ensure_envs(sizeof(envm) / sizeof(envm[0]), envm) != 0) {
     if (ensure_envs(sizeof(envm) / sizeof(envm[0]), envm) != 0) {
         fprintf(stderr, "Env variable misconfiguration.\n");
         exit(1);
     }
 
     conn_args.port = atoi(port_str);
-
-    conn_args.port = atoi(port_str);
     // if 0, mysql does default port handling, no exit
-
-    printf("All env variables successfully loaded.\n- Host: %s\n- Port: %d\n- User: %s\n- Password: %s\n- Database: %s\n",
-        conn_args.host, conn_args.port, conn_args.username, conn_args.password, conn_args.database);
 
     printf("All env variables successfully loaded.\n- Host: %s\n- Port: %d\n- User: %s\n- Password: %s\n- Database: %s\n",
         conn_args.host, conn_args.port, conn_args.username, conn_args.password, conn_args.database);
@@ -236,17 +205,10 @@ int main(int argc, char *argv[]) {
     }
 
     MYSQL *CONN = connect(&conn_args);
-
-    MYSQL *CONN = connect(&conn_args);
     if (CONN == NULL) {
         fprintf(stderr, "Connection failed\n");
-        fprintf(stderr, "Connection failed\n");
         exit(1);
     }
-
-    char table_name[TABLE_NAME_CAP];
-    if (prompt_select_table(CONN, &table_name) != STATUS_OK) {
-        printf("Could not fetch table information.\n");
 
     char table_name[TABLE_NAME_CAP];
     if (prompt_select_table(CONN, &table_name) != STATUS_OK) {
@@ -254,7 +216,6 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    mysql_close(CONN);
     mysql_close(CONN);
     printf("-------------------------------\n");
     printf("MySQL connection closed.\n");
