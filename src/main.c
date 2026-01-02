@@ -1,14 +1,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <mysql.h>
 #include <pthread.h>
 
-
-#define NUM_THREADS (1)
+#define NUM_THREADS (4)
 
 #define MAX_TABLE_OPTIONS (10)
 #define TABLE_NAME_CAP (25)
+#define CHUNK_SIZE (5)
 
 #define STATUS_OK (0)
 
@@ -26,9 +27,9 @@ typedef struct {
 } Conn_Args;
 
 typedef struct {
-    const size_t thread_id;
-    const Conn_Args *conn_args;
-    const char *query_string;
+    size_t thread_id;
+    Conn_Args *conn_args;
+    char *query_string;
 } Thread_Args;
 
 int ensure_envs(size_t envc, const Env_Map *envm) {
@@ -40,7 +41,7 @@ int ensure_envs(size_t envc, const Env_Map *envm) {
         }
         *envm[i].var_dest = val;
     }
-    return 0;
+    return STATUS_OK;
 }
 
 int prompt_select_table(MYSQL *CONN, char (*table_name)[TABLE_NAME_CAP]) {
@@ -176,6 +177,30 @@ void *worker_routine(void *ptr) {
     return NULL;
 }
 
+char *build_thread_query(size_t thread_id, char *table_name) {
+    printf("Building query for thread %zu\n", thread_id);
+
+    const char *query_template = "SELECT * FROM %s LIMIT %d OFFSET %d";
+    int offset = CHUNK_SIZE * thread_id;
+
+    int query_len = snprintf(NULL, 0, query_template, table_name, CHUNK_SIZE, offset);
+    if (query_len < 0) {
+        fprintf(stderr, "Failed length calculation for query!\n");
+        return "";
+    }
+
+    char *query = calloc(query_len + 1, sizeof(char));
+    if (!query) {
+        fprintf(stderr, "Failed malloc for query!\n");
+        return "";
+    }
+
+    snprintf(query, query_len + 1, query_template, table_name, CHUNK_SIZE, offset);
+
+    printf("Query is: %s\n", query);
+    return query;
+}
+
 int main(int argc, char *argv[]) {
     const char *port_str;
     Conn_Args conn_args = {};
@@ -220,22 +245,26 @@ int main(int argc, char *argv[]) {
     printf("-------------------------------\n");
     printf("MySQL connection closed.\n");
     
-    const char *query_template = "SELECT * FROM %s LIMIT 20";
-    
-    char *query = malloc(strlen(query_template) - 2 + strlen(table_name) + 1);
-    sprintf(query, query_template, table_name);
-    printf("Query is: %s\n", query);
+    pthread_t threads[NUM_THREADS];
+    Thread_Args thread_args[NUM_THREADS];
 
-    Thread_Args thread_args = {
-        0,
-        &conn_args,
-        query
-    };
+    for (size_t i = 0; i < NUM_THREADS; i++) {
+        thread_args[i].thread_id = i;
+        thread_args[i].conn_args = &conn_args;
+        // MALLOCed, MUST FREE LATER
+        thread_args[i].query_string = build_thread_query(i, table_name);
 
-    worker_routine((void *)(&thread_args));
+        pthread_create(&threads[i], NULL, worker_routine, (void *)(&thread_args[i]));
+        printf("Created thread %zu\n", i);
+    }
+
+    for (size_t i = 0; i < NUM_THREADS; i++) {
+        pthread_join(threads[i], NULL);
+        free(thread_args[i].query_string);
+    }
     
     mysql_library_end();
-    free(query);
+
     printf("-------------------------------\n");
     printf("MySQL client library successfully closed.\n");
     exit(0);
