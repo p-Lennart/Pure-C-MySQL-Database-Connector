@@ -2,16 +2,36 @@
 #include <stdlib.h>
 #include <string.h>
 #include <mysql.h>
+#include <pthread.h>
+
+
+#define NUM_THREADS (1)
 
 #define MAX_TABLE_OPTIONS (10)
 #define TABLE_NAME_CAP (25)
 
+#define STATUS_OK (0)
+
 typedef struct {
     const char *env_name;
     const char **var_dest;
-} EnvMap;
+} Env_Map;
 
-int ensure_envs(size_t envc, const EnvMap *envm) {
+typedef struct {
+    const char *host;
+    unsigned int port;
+    const char *username;
+    const char *password;
+    const char *database;
+} Conn_Args;
+
+typedef struct {
+    const size_t thread_id;
+    const Conn_Args *conn_args;
+    const char *query_string;
+} Thread_Args;
+
+int ensure_envs(size_t envc, const Env_Map *envm) {
     for (size_t i = 0; i < envc; i++) {
         const char *val = getenv(envm[i].env_name);
         if (!val) {
@@ -67,7 +87,7 @@ int prompt_select_table(MYSQL *CONN, char (*table_name)[TABLE_NAME_CAP]) {
     (*table_name)[TABLE_NAME_CAP - 1] = '\0';
 
     mysql_free_result(result);
-    return 0;
+    return STATUS_OK;
 }
 
 void print_query_result(MYSQL_RES *result) {
@@ -90,129 +110,133 @@ void print_query_result(MYSQL_RES *result) {
     }
 }
 
-int query_singlestore(MYSQL *CONN) {
-    int status = 0;
+MYSQL *connect(const Conn_Args *conn_args) {
+    MYSQL *CONN = mysql_init(NULL);
+    if (CONN == NULL) {
+        fprintf(stderr, "could not initialize MySQL structure\n");
+        return NULL;
+    }
     
-    MYSQL_RES *result;
+    printf("MySQL structure successfully initated with address %p.\n", CONN);
+    // SingleStore cloud specific options
+    const char *tls_version = "TLSv1.2";
     
-    char table_name[TABLE_NAME_CAP];
-    if (prompt_select_table(CONN, &table_name) != 0) {
-        printf("Could not fetch table information.\n");
-        status = 1;
-        goto cleanup;
+    mysql_options(CONN, MYSQL_OPT_TLS_VERSION, tls_version);
+    mysql_options(CONN, MYSQL_DEFAULT_AUTH, "mysql_native_password");
+    
+    const char *unix_socket = NULL;
+    unsigned long client_flag = 0;
+
+    if (!mysql_real_connect(
+        CONN,
+        conn_args->host,
+        conn_args->username,
+        conn_args->password,
+        conn_args->database,
+        conn_args->port,
+        unix_socket,
+        client_flag
+    )) {
+        fprintf(stderr, "Failed to connect, with error:\n%s\n", mysql_error(CONN));
+        return NULL;
     }
 
-    const char *query_template = "SELECT COUNT(*) AS total_rows";
-    // const char *query_template = "SELECT * FROM %s LIMIT 20";
-    
-    char *query = malloc(strlen(query_template) - 2 + strlen(table_name) + 1);
-    sprintf(query, query_template, table_name);
+    printf("Successfully connected to host.\n");
+    printf("-------------------------------\n");
 
-    printf("Query is: %s\n", query);
-    if (mysql_query(CONN, query)) {
-        fprintf(stderr, "Query error: %s\n", mysql_error(CONN));
-        status = 1;
-        goto cleanup;
+    return CONN;
+}
+
+void *worker_routine(void *ptr) {
+    Thread_Args *thread_args = (Thread_Args *)(ptr);
+
+    MYSQL *CONN = connect(thread_args->conn_args);
+    if (CONN == NULL) {
+        fprintf(stderr, "[Thread #%zu] Connection failed\n", thread_args->thread_id);
+        return NULL;
+    }
+
+    MYSQL_RES *result;
+    if (mysql_query(CONN, thread_args->query_string)) {
+        fprintf(stderr, "[Thread #%zu] Query error: %s\n", thread_args->thread_id, mysql_error(CONN));
+        return NULL;
     }
 
     result = mysql_use_result(CONN);
     if (result == NULL) {
-        fprintf(stderr, "Result error: %s\n", mysql_error(CONN));
-        status = 1;
-        goto cleanup;
+        fprintf(stderr, "[Thread #%zu] Result error: %s\n", thread_args->thread_id, mysql_error(CONN));
+        return NULL;
     }
 
     // Process query result
     print_query_result(result);
-    
-    mysql_free_result(result);
 
-cleanup:
-    free(query);
-    query = NULL;
-    return status;
+    mysql_free_result(result);
+    printf("[Thread #%zu] Success.\n", thread_args->thread_id);
+    return NULL;
 }
 
 int main(int argc, char *argv[]) {
-    MYSQL *CONN;
-
-    // Params
-    const char *host;
     const char *port_str;
-    const char *username;
-    const char *password;
-    const char *database;
+    Conn_Args conn_args = {};
 
-    EnvMap envm[] = { 
-        { "SS_host", &host },
+    Env_Map envm[] = { 
+        { "SS_host", &(conn_args.host) },
         { "SS_port", &port_str },
-        { "SS_user", &username },
-        { "SS_pass", &password },
-        { "SS_db", &database },
+        { "SS_user", &(conn_args.username) },
+        { "SS_pass", &(conn_args.password) },
+        { "SS_db", &(conn_args.database) }
     };
 
-    if (ensure_envs(sizeof envm / sizeof envm[0], envm) != 0) {
+    if (ensure_envs(sizeof(envm) / sizeof(envm[0]), envm) != 0) {
         fprintf(stderr, "Env variable misconfiguration.\n");
         exit(1);
     }
-    
-    unsigned int port = atoi(port_str);
+
+    conn_args.port = atoi(port_str);
     // if 0, mysql does default port handling, no exit
+
+    printf("All env variables successfully loaded.\n- Host: %s\n- Port: %d\n- User: %s\n- Password: %s\n- Database: %s\n",
+        conn_args.host, conn_args.port, conn_args.username, conn_args.password, conn_args.database);
 
     if (mysql_library_init(0, NULL, NULL) != 0) {
         fprintf(stderr, "could not initialize MySQL client library\n");
         exit(1);
     }
-    
-    printf("All env variables successfully loaded.\n- Host: %s\n- Port: %d\n- User: %s\n- Password: %s\n- Database: %s\n",
-        host, port, username, password, database);
 
-    // Conn
-    CONN = mysql_init(NULL);
+    MYSQL *CONN = connect(&conn_args);
     if (CONN == NULL) {
-        fprintf(stderr, "could not initialize MySQL structure\n");
-        exit(1);
-    }
-    printf("MySQL structure successfully initated with address %p.\n", CONN);
-    
-    // SingleStore cloud specific options
-    const char *tls_version = "TLSv1.2";
-    mysql_options(CONN, MYSQL_OPT_TLS_VERSION, tls_version);
-    mysql_options(CONN, MYSQL_DEFAULT_AUTH, "mysql_native_password");
-
-    const char *unix_socket = NULL;
-    unsigned long client_flag = 0;
-    
-    if (!mysql_real_connect(
-        CONN,
-        host,
-        username,
-        password,
-        database,
-        port,
-        unix_socket,
-        client_flag
-    )) {
-        fprintf(stderr, "Failed to connect, with error:\n%s\n", mysql_error(CONN));
+        fprintf(stderr, "Connection failed\n");
         exit(1);
     }
 
-    printf("Successfully connected to host.\n");
-    printf("-------------------------------\n");
-    
-    int result = query_singlestore(CONN);
-    printf("-------------------------------\n");
+    char table_name[TABLE_NAME_CAP];
+    if (prompt_select_table(CONN, &table_name) != STATUS_OK) {
+        printf("Could not fetch table information.\n");
+        exit(1);
+    }
 
     mysql_close(CONN);
-    mysql_library_end();
-    printf("MySQL connection and client library successfully closed.\n");
+    printf("-------------------------------\n");
+    printf("MySQL connection closed.\n");
     
-    if (result == 0) {
-        printf("Query sequence executed as intended.\n");
-        exit(0);
-    } else {
-        printf("Query sequence did not execute as intended.\n");
-        exit(1);
-    }
+    const char *query_template = "SELECT * FROM %s LIMIT 20";
+    
+    char *query = malloc(strlen(query_template) - 2 + strlen(table_name) + 1);
+    sprintf(query, query_template, table_name);
+    printf("Query is: %s\n", query);
 
+    Thread_Args thread_args = {
+        0,
+        &conn_args,
+        query
+    };
+
+    worker_routine((void *)(&thread_args));
+    
+    mysql_library_end();
+    free(query);
+    printf("-------------------------------\n");
+    printf("MySQL client library successfully closed.\n");
+    exit(0);
 }
