@@ -1,23 +1,30 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 #include <math.h>
 #include <mysql.h>
 #include <pthread.h>
-
+    
 #include "../include/utils.h"
 #include "../include/char_queue.h"
 
-#define NUM_THREADS (4)
+#define NUM_PRODUCERS (1)
+#define NUM_CONSUMERS (4)
+
+#define QUEUE_SIZE (100)
+#define MAX_DATA_LEN (25)
+#define ROWS_PER_STATUS_CHECK (1000)
 
 #define DATA_FIELD ("price")
 
 #define MAX_TABLE_OPTIONS (10)
 #define TABLE_NAME_CAP (25)
-// #define ROW_LIMIT (100)
 
+#define STATUS_ERROR (1)
 #define STATUS_OK (0)
+#define STATUS_FINISHED (-1)
 
 typedef struct {
     const char *host;
@@ -29,16 +36,23 @@ typedef struct {
 
 typedef struct {
     long double sum;  
-    unsigned long n;
+    size_t n;
 } Data_Aggregate;
 
 typedef struct {
     size_t thread_id;
+    _Atomic int *status;
+    Char_Queue *queue;
     Conn_Args *conn_args;
     char *query_string;
-    _Atomic int *fail_flag;
+} Producer_Args;
+
+typedef struct {
+    size_t thread_id;
+    _Atomic int *status;
+    Char_Queue *queue;
     Data_Aggregate *result;
-} Thread_Args;
+} Consumer_Args;
 
 void update_da(Data_Aggregate *da, long double update) {
     da->sum += update;
@@ -63,13 +77,13 @@ int prompt_select_table(MYSQL *CONN, char (*table_name)[TABLE_NAME_CAP]) {
 
     if (mysql_query(CONN, "SHOW TABLES;")) {
         fprintf(stderr, "Query error: %s\n", mysql_error(CONN));
-        return 1;
+        return STATUS_ERROR;
     }
 
     result = mysql_use_result(CONN);
     if (result == NULL) {
         fprintf(stderr, "Result error: %s\n", mysql_error(CONN));
-        return 1;
+        return STATUS_ERROR;
     }
 
     char table_names[MAX_TABLE_OPTIONS][TABLE_NAME_CAP];
@@ -138,86 +152,99 @@ MYSQL *connect(const Conn_Args *conn_args) {
     return CONN;
 }
 
-Data_Aggregate process_result(MYSQL_RES *result, Thread_Args *thread_args) {
+size_t producer_process_result(MYSQL_RES *result, Producer_Args *producer_args) {
     size_t num_fields = 0;
+    size_t num_rows = 0;
     size_t idx_target = -1;
 
-    Data_Aggregate res_data = { 0.0, 0 };
-    
     MYSQL_FIELD *field;
     while ((field = mysql_fetch_field(result))) {
-        // printf("%s\t", field->name);
-        
         if (strncmp(field->name, DATA_FIELD, strlen(DATA_FIELD)) == 0) {
             idx_target = num_fields;
         }
         num_fields += 1;
     }
-    // printf("\n");
 
     if (idx_target == -1) {
-        fprintf(stderr, "[Thread #%zu] Could not locate target data field '%s' in result\n",
-            thread_args->thread_id, DATA_FIELD);
-        atomic_store(thread_args->fail_flag, 1);
+        fprintf(stderr, "[Producer #%zu] Could not locate target data field '%s' in result\n",
+            producer_args->thread_id, DATA_FIELD);
+        atomic_store(producer_args->status, STATUS_ERROR);
+        return STATUS_ERROR;
     }
 
-    if (atomic_load(thread_args->fail_flag) != STATUS_OK) {
-        fprintf(stderr, "[Thread #%zu] Exiting according to fail flag\n", thread_args->thread_id);
-        return res_data;
+    if (atomic_load(producer_args->status) == STATUS_ERROR) {
+        fprintf(stderr, "[Producer #%zu] Exiting according to fail flag\n", producer_args->thread_id);
+        return STATUS_ERROR;
     }
 
     // must fetch row until NULL when using use_result over store_result
     MYSQL_ROW row;
     while ((row = mysql_fetch_row(result))) {
-        if (atomic_load(thread_args->fail_flag) != STATUS_OK) {
-            fprintf(stderr, "[Thread #%zu] Exiting according to fail flag\n", thread_args->thread_id);
+        if (num_rows % ROWS_PER_STATUS_CHECK == 0 
+            && atomic_load(producer_args->status) == STATUS_ERROR) { // check every ___ rows
+            fprintf(stderr, "[Producer #%zu] Exiting according to fail flag\n", producer_args->thread_id);
             break;
         }
 
-        // for (size_t col = 0; col < num_fields; col++) {
-        //     printf("%s\t", row[col]);
-        // }
-        // printf("\n");
-
-        long double row_data = strtod(row[idx_target], NULL);
-        update_da(&res_data, row_data);
+        push_back(producer_args->queue, row[idx_target]);
+        num_rows += 1;
     }
 
-    return res_data;
+    return num_rows;
 }
 
-void *worker_routine(void *ptr) {
-    Thread_Args *thread_args = (Thread_Args *)(ptr);
+void *producer_routine(void *ptr) {
+    Producer_Args *thread_args = (Producer_Args *)(ptr);
 
     MYSQL *CONN = connect(thread_args->conn_args);
     if (CONN == NULL) {
-        fprintf(stderr, "[Thread #%zu] Connection failed\n", thread_args->thread_id);
-        atomic_store(thread_args->fail_flag, 1);
+        fprintf(stderr, "[Producer #%zu] Connection failed\n", thread_args->thread_id);
+        atomic_store(thread_args->status, STATUS_ERROR);
         return NULL;
     }
 
     MYSQL_RES *result;
     if (mysql_query(CONN, thread_args->query_string)) {
-        fprintf(stderr, "[Thread #%zu] Query error: %s\n", thread_args->thread_id, mysql_error(CONN));
-        atomic_store(thread_args->fail_flag, 1);
+        fprintf(stderr, "[Producer #%zu] Query error: %s\n", thread_args->thread_id, mysql_error(CONN));
+        atomic_store(thread_args->status, STATUS_ERROR);
         return NULL;
     }
 
     result = mysql_use_result(CONN);
     if (result == NULL) {
-        fprintf(stderr, "[Thread #%zu] Result error: %s\n", thread_args->thread_id, mysql_error(CONN));
-        atomic_store(thread_args->fail_flag, 1);
+        fprintf(stderr, "[Producer #%zu] Result error: %s\n", thread_args->thread_id, mysql_error(CONN));
+        atomic_store(thread_args->status, STATUS_ERROR);
         return NULL;
     }
 
     // Process query result
-    *(thread_args->result) = process_result(result, thread_args);
+    size_t rows_read = producer_process_result(result, thread_args);
+    printf("[Producer #%zu] n=%zu\n", thread_args->thread_id, rows_read);
 
     mysql_free_result(result);
+    return NULL;
+}
 
-    
-    printf("[Thread #%zu] n=%lu, avg=%Lf\n", 
-        thread_args->thread_id, (thread_args->result)->n, average(thread_args->result));
+void *consumer_routine(void *ptr) {
+    Consumer_Args *consumer_args = (Consumer_Args *)(ptr);
+    Data_Aggregate result = { 0, 0 };
+
+    char *data = deque_front(consumer_args->queue);
+    while (data) {
+        if (result.n % ROWS_PER_STATUS_CHECK == 0 
+            && atomic_load(consumer_args->status) == STATUS_ERROR) { // check every ___ rows
+            fprintf(stderr, "[Consumer #%zu] Exiting according to fail flag\n", consumer_args->thread_id);
+            break;
+        }
+        
+        long double row_data = strtod(data, NULL);
+        update_da(&result, row_data);
+        data = deque_front(consumer_args->queue);
+    }
+
+    printf("[Consumer #%zu] n=%zu\n", consumer_args->thread_id, result.n);
+    *(consumer_args->result) = result;
+
     return NULL;
 }
 
@@ -225,7 +252,7 @@ char *build_thread_query(size_t thread_id, char *table_name) {
     const char *query_template = 
         "SELECT date, %s FROM %s WHERE MOD(DAY(date), %d)=%zu";
 
-    int query_len = snprintf(NULL, 0, query_template, DATA_FIELD, table_name, NUM_THREADS, thread_id);
+    int query_len = snprintf(NULL, 0, query_template, DATA_FIELD, table_name, NUM_PRODUCERS, thread_id);
     if (query_len < 0) {
         fprintf(stderr, "Failed length calculation for query!\n");
         return "";
@@ -237,7 +264,7 @@ char *build_thread_query(size_t thread_id, char *table_name) {
         return "";
     }
 
-    snprintf(query, query_len + 1, query_template, DATA_FIELD, table_name, NUM_THREADS, thread_id);
+    snprintf(query, query_len + 1, query_template, DATA_FIELD, table_name, NUM_PRODUCERS, thread_id);
     return query;
 }
 
@@ -286,41 +313,68 @@ int main(int argc, char *argv[]) {
     mysql_close(CONN);
     
     printf("-------------------------------\n");
-    pthread_t threads[NUM_THREADS];
-    Thread_Args thread_args[NUM_THREADS];
-    _Atomic int fail_flag = STATUS_OK;
-    Data_Aggregate results[NUM_THREADS];
-
-    for (size_t i = 0; i < NUM_THREADS; i++) {
-        thread_args[i].thread_id = i;
-        thread_args[i].conn_args = &conn_args;
-        thread_args[i].fail_flag = &fail_flag;
-        thread_args[i].result = &results[i];
-        // MALLOCed, MUST FREE LATER
-        thread_args[i].query_string = build_thread_query(i, table_name);
-        
-        pthread_create(&threads[i], NULL, worker_routine, (void *)(&thread_args[i]));
-        printf("[Thread #%zu] %s\n", i, thread_args[i].query_string);
-    }
-    printf("-------------------------------\n");
+    
+    Char_Queue data_queue = init_queue(QUEUE_SIZE, MAX_DATA_LEN);
+    _Atomic int global_status = STATUS_OK;
+    
+    pthread_t producer_threads[NUM_PRODUCERS];
+    Producer_Args producer_args[NUM_PRODUCERS];
+    
+    pthread_t consumer_threads[NUM_CONSUMERS];
+    Consumer_Args consumer_args[NUM_CONSUMERS];
+    Data_Aggregate consumer_results[NUM_CONSUMERS];
 
     Data_Aggregate final_result = {0, 0};
-
-    for (size_t i = 0; i < NUM_THREADS; i++) {
-        pthread_join(threads[i], NULL);
-        free(thread_args[i].query_string);
-        if (atomic_load(&fail_flag) == STATUS_OK) {
-            merge_da(&final_result, &results[i]);
-        }
+    
+    for (size_t i = 0; i < NUM_PRODUCERS; i++) {
+        producer_args[i].thread_id = i;
+        producer_args[i].status = &global_status;
+        producer_args[i].queue = &data_queue;
+        producer_args[i].conn_args = &conn_args;
+        producer_args[i].query_string = build_thread_query(i, table_name); // MALLOCed, MUST FREE LATER
+        
+        pthread_create(&producer_threads[i], NULL, producer_routine, (void *)(&producer_args[i]));
+        printf("[Producer #%zu] %s\n", i, producer_args[i].query_string);
     }
 
+    for (size_t i = 0; i < NUM_CONSUMERS; i++) {
+        consumer_args[i].thread_id = i;
+        consumer_args[i].status = &global_status;
+        consumer_args[i].queue = &data_queue;
+        consumer_args[i].result = &consumer_results[i];
+        pthread_create(&consumer_threads[i], NULL, consumer_routine, (void *)(&consumer_args[i]));
+        printf("[Consumer #%zu] ", i);
+    }
+    printf("\n");
+
     printf("-------------------------------\n");
+
+    for (size_t i = 0; i < NUM_PRODUCERS; i++) {
+        pthread_join(producer_threads[i], NULL);
+        free(producer_args[i].query_string);
+    }
+    
+    if (atomic_load(&global_status) == STATUS_OK) {
+        atomic_store(&global_status, STATUS_FINISHED);
+    }
+    close_queue(&data_queue);
+
+   for (size_t i = 0; i < NUM_CONSUMERS; i++) {
+        pthread_join(consumer_threads[i], NULL);
+        merge_da(&final_result, &consumer_results[i]);
+    }
+
+    free_queue(&data_queue);
+
+    printf("-------------------------------\n");
+    
     mysql_library_end();
     printf("MySQL client library successfully closed.\n");
     
-    if (atomic_load(&fail_flag) == STATUS_OK) {
+    if (atomic_load(&global_status) != STATUS_ERROR) {
         printf("Query sequence executed as intended.\n");
         printf("Final result: %Lf\n", average(&final_result));
+        printf("(%Lf/%zu)", final_result.sum, final_result.n);
         exit(0);
     } else {
         printf("Query sequence did not execute as intended.\n");
