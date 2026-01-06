@@ -134,6 +134,7 @@ bool push_back(Char_Queue *cq, const char *source) {
     pthread_mutex_lock(&cq->lock);
     
     while (queue_full_unlocked(cq)) {
+        printf("Queue is full! (%zu/%zu)\n", cq->size, cq->capacity);
         pthread_cond_wait(&cq->not_full, &cq->lock);
     }
 

@@ -1,43 +1,26 @@
-#include <stdatomic.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdbool.h>
-#include <string.h>
 #include <math.h>
 #include <mysql.h>
 #include <pthread.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
     
-#include "../include/utils.h"
 #include "../include/char_queue.h"
+#include "../include/mysql_utils.h"
+#include "../include/status_codes.h"
+#include "../include/utils.h"
 
-#define NUM_PRODUCERS (1)
-#define NUM_CONSUMERS (4)
+#define NUM_PRODUCERS (2)
+#define NUM_CONSUMERS (2)
 
-#define QUEUE_SIZE (100)
-#define MAX_DATA_LEN (25)
+#define QUEUE_SIZE (200)
+#define MAX_DATA_LEN (15)
 #define ROWS_PER_STATUS_CHECK (1000)
 
 #define DATA_FIELD ("price")
-
-#define MAX_TABLE_OPTIONS (10)
-#define TABLE_NAME_CAP (25)
-
-#define STATUS_ERROR (1)
-#define STATUS_OK (0)
-#define STATUS_FINISHED (-1)
-
-typedef struct {
-    const char *host;
-    unsigned int port;
-    const char *username;
-    const char *password;
-    const char *database;
-} Conn_Args;
-
-typedef struct {
-    long double sum;  
-    size_t n;
-} Data_Aggregate;
+#define SHARDING_FIELD ("DAY(date)")
 
 typedef struct {
     size_t thread_id;
@@ -53,104 +36,6 @@ typedef struct {
     Char_Queue *queue;
     Data_Aggregate *result;
 } Consumer_Args;
-
-void update_da(Data_Aggregate *da, long double update) {
-    da->sum += update;
-    da->n += 1;
-}
-
-void merge_da(Data_Aggregate *da1, Data_Aggregate *da2) {
-    da1->sum += da2->sum;
-    da1->n += da2->n;
-}
-
-long double average(Data_Aggregate *da) {
-    if (da->n == 0) {
-        return 0.0;
-    }
-    return da->sum / da->n;
-}
-
-int prompt_select_table(MYSQL *CONN, char (*table_name)[TABLE_NAME_CAP]) {
-    MYSQL_RES *result;
-    MYSQL_ROW row;
-
-    if (mysql_query(CONN, "SHOW TABLES;")) {
-        fprintf(stderr, "Query error: %s\n", mysql_error(CONN));
-        return STATUS_ERROR;
-    }
-
-    result = mysql_use_result(CONN);
-    if (result == NULL) {
-        fprintf(stderr, "Result error: %s\n", mysql_error(CONN));
-        return STATUS_ERROR;
-    }
-
-    char table_names[MAX_TABLE_OPTIONS][TABLE_NAME_CAP];
-    size_t table_count = 0;
-
-    printf("Select Table:\n");
-    while ((row = mysql_fetch_row(result)) && table_count < MAX_TABLE_OPTIONS) {
-        char *tname = row[0];
-        printf("[%zu] %s\n", table_count, tname);
-        
-        strncpy(table_names[table_count], tname, TABLE_NAME_CAP - 1);
-        table_names[table_count][TABLE_NAME_CAP - 1] = '\0';
-
-        table_count += 1;
-    }
-
-    char buffer[32];
-    fgets(buffer, sizeof(buffer), stdin);
-    size_t sel_table = strtoul(buffer, NULL, 10);
-
-    if (sel_table >= table_count) {
-        printf("Did not select a table ∈ [0, %zu).\nDefaulting to [0] %s\n", table_count, table_names[0]);
-        sel_table = 0;
-    } else {
-        printf("Selected [%zu] %s\n", sel_table, table_names[sel_table]);
-    }
-    
-    strncpy(*table_name, table_names[sel_table], TABLE_NAME_CAP - 1);
-    (*table_name)[TABLE_NAME_CAP - 1] = '\0';
-
-    mysql_free_result(result);
-    return STATUS_OK;
-}
-
-MYSQL *connect(const Conn_Args *conn_args) {
-    MYSQL *CONN = mysql_init(NULL);
-    if (CONN == NULL) {
-        fprintf(stderr, "could not initialize MySQL structure\n");
-        return NULL;
-    }
-    // printf("MySQL structure successfully initated with address %p.\n", CONN);
-    
-    // SingleStore cloud specific options
-    const char *tls_version = "TLSv1.2";
-    
-    mysql_options(CONN, MYSQL_OPT_TLS_VERSION, tls_version);
-    mysql_options(CONN, MYSQL_DEFAULT_AUTH, "mysql_native_password");
-    
-    const char *unix_socket = NULL;
-    unsigned long client_flag = 0;
-
-    if (!mysql_real_connect(
-        CONN,
-        conn_args->host,
-        conn_args->username,
-        conn_args->password,
-        conn_args->database,
-        conn_args->port,
-        unix_socket,
-        client_flag
-    )) {
-        fprintf(stderr, "Failed to connect, with error:\n%s\n", mysql_error(CONN));
-        return NULL;
-    }
-
-    return CONN;
-}
 
 size_t producer_process_result(MYSQL_RES *result, Producer_Args *producer_args) {
     size_t num_fields = 0;
@@ -229,6 +114,8 @@ void *consumer_routine(void *ptr) {
     Consumer_Args *consumer_args = (Consumer_Args *)(ptr);
     Data_Aggregate result = { 0, 0 };
 
+    size_t largest_datalen = 0;
+
     char *data = deque_front(consumer_args->queue);
     while (data) {
         if (result.n % ROWS_PER_STATUS_CHECK == 0 
@@ -236,23 +123,28 @@ void *consumer_routine(void *ptr) {
             fprintf(stderr, "[Consumer #%zu] Exiting according to fail flag\n", consumer_args->thread_id);
             break;
         }
+
+        size_t len = strlen(data);
+        if (len > largest_datalen) {
+            largest_datalen = len;
+        }
         
         long double row_data = strtod(data, NULL);
         update_da(&result, row_data);
         data = deque_front(consumer_args->queue);
     }
 
-    printf("[Consumer #%zu] n=%zu\n", consumer_args->thread_id, result.n);
+    printf("[Consumer #%zu] n=%zu, largest strlen=%zu\n", consumer_args->thread_id, result.n, largest_datalen);
     *(consumer_args->result) = result;
 
     return NULL;
 }
 
-char *build_thread_query(size_t thread_id, char *table_name) {
+char *build_producer_query(size_t thread_id, char *table_name) {
     const char *query_template = 
-        "SELECT date, %s FROM %s WHERE MOD(DAY(date), %d)=%zu";
+        "SELECT %s FROM %s WHERE MOD(%s, %d)=%zu";
 
-    int query_len = snprintf(NULL, 0, query_template, DATA_FIELD, table_name, NUM_PRODUCERS, thread_id);
+    int query_len = snprintf(NULL, 0, query_template, DATA_FIELD, table_name, SHARDING_FIELD, NUM_PRODUCERS, thread_id);
     if (query_len < 0) {
         fprintf(stderr, "Failed length calculation for query!\n");
         return "";
@@ -264,7 +156,7 @@ char *build_thread_query(size_t thread_id, char *table_name) {
         return "";
     }
 
-    snprintf(query, query_len + 1, query_template, DATA_FIELD, table_name, NUM_PRODUCERS, thread_id);
+    snprintf(query, query_len + 1, query_template, DATA_FIELD, table_name, SHARDING_FIELD, NUM_PRODUCERS, thread_id);
     return query;
 }
 
@@ -313,6 +205,7 @@ int main(int argc, char *argv[]) {
     mysql_close(CONN);
     
     printf("-------------------------------\n");
+    double start_time = get_time_sec();
     
     Char_Queue data_queue = init_queue(QUEUE_SIZE, MAX_DATA_LEN);
     _Atomic int global_status = STATUS_OK;
@@ -326,12 +219,13 @@ int main(int argc, char *argv[]) {
 
     Data_Aggregate final_result = {0, 0};
     
+    
     for (size_t i = 0; i < NUM_PRODUCERS; i++) {
         producer_args[i].thread_id = i;
         producer_args[i].status = &global_status;
         producer_args[i].queue = &data_queue;
         producer_args[i].conn_args = &conn_args;
-        producer_args[i].query_string = build_thread_query(i, table_name); // MALLOCed, MUST FREE LATER
+        producer_args[i].query_string = build_producer_query(i, table_name); // MALLOCed, MUST FREE LATER
         
         pthread_create(&producer_threads[i], NULL, producer_routine, (void *)(&producer_args[i]));
         printf("[Producer #%zu] %s\n", i, producer_args[i].query_string);
@@ -370,11 +264,12 @@ int main(int argc, char *argv[]) {
     
     mysql_library_end();
     printf("MySQL client library successfully closed.\n");
-    
+    double end_time = get_time_sec();
+
     if (atomic_load(&global_status) != STATUS_ERROR) {
         printf("Query sequence executed as intended.\n");
-        printf("Final result: %Lf\n", average(&final_result));
-        printf("(%Lf/%zu)", final_result.sum, final_result.n);
+        printf("Execution time: %.03lf seconds\n", end_time - start_time);
+        printf("Final result: %Lf, n=%zu, sum=%.02Lf\n", average_da(&final_result), final_result.n, final_result.sum);
         exit(0);
     } else {
         printf("Query sequence did not execute as intended.\n");
